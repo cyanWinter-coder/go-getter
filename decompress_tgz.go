@@ -26,13 +26,22 @@ type TarGzipDecompressor struct {
 	FilesLimit int
 }
 
-func (d *TarGzipDecompressor) Decompress(dst, src string, dir bool, umask os.FileMode) error {
+func (d *TarGzipDecompressor) Decompress(dst, src string, dir bool, umask os.FileMode) (err error) {
+	// Any security or integrity error aborts the batch and removes
+	// everything this batch created.
+	tracker := new(extractTracker)
+	defer func() {
+		if err != nil {
+			tracker.cleanup()
+		}
+	}()
+
 	// If we're going into a directory we should make that first
 	mkdir := dst
 	if !dir {
 		mkdir = filepath.Dir(dst)
 	}
-	if err := os.MkdirAll(mkdir, mode(0755, umask)); err != nil {
+	if err = tracker.mkdirAll(mkdir, mode(0755, umask)); err != nil {
 		return err
 	}
 
@@ -50,5 +59,5 @@ func (d *TarGzipDecompressor) Decompress(dst, src string, dir bool, umask os.Fil
 	}
 	defer func() { _ = gzipR.Close() }()
 
-	return untar(gzipR, dst, src, dir, umask, d.FileSizeLimit, d.FilesLimit)
+	return untar(gzipR, dst, src, dir, umask, d.FileSizeLimit, d.FilesLimit, tracker)
 }

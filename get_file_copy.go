@@ -42,10 +42,15 @@ func copyReader(dst string, src io.Reader, fmode, umask os.FileMode, fileSizeLim
 	defer func() { _ = dstF.Close() }()
 
 	if fileSizeLimit > 0 {
-		src = io.LimitReader(src, fileSizeLimit)
+		// Read one byte past the limit so an oversized source is
+		// detected instead of silently truncated.
+		src = io.LimitReader(src, fileSizeLimit+1)
 	}
 
-	_, err = io.Copy(dstF, src)
+	n, err := io.Copy(dstF, src)
+	if err == nil && fileSizeLimit > 0 && n > fileSizeLimit {
+		err = fmt.Errorf("file larger than limit: %d", fileSizeLimit)
+	}
 	if err != nil {
 		// Close & remove the file in case of partial write
 		_ = dstF.Close()

@@ -19,14 +19,22 @@ type Bzip2Decompressor struct {
 	FileSizeLimit int64
 }
 
-func (d *Bzip2Decompressor) Decompress(dst, src string, dir bool, umask os.FileMode) error {
+func (d *Bzip2Decompressor) Decompress(dst, src string, dir bool, umask os.FileMode) (err error) {
 	// Directory isn't supported at all
 	if dir {
 		return fmt.Errorf("bzip2-compressed files can only unarchive to a single file")
 	}
 
+	// Any error aborts the batch and removes everything this batch created.
+	tracker := new(extractTracker)
+	defer func() {
+		if err != nil {
+			tracker.cleanup()
+		}
+	}()
+
 	// If we're going into a directory we should make that first
-	if err := os.MkdirAll(filepath.Dir(dst), mode(0755, umask)); err != nil {
+	if err = tracker.mkdirAll(filepath.Dir(dst), mode(0755, umask)); err != nil {
 		return err
 	}
 

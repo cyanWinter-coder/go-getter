@@ -6,9 +6,14 @@ package getter
 import (
 	"archive/zip"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
+
+// maxLinkTargetSize bounds the size of a symbolic link target stored in a
+// zip entry. Anything larger is rejected as bogus.
+const maxLinkTargetSize = 8192
 
 // ZipDecompressor is an implementation of Decompressor that can
 // decompress zip files.
@@ -26,13 +31,22 @@ type ZipDecompressor struct {
 	FilesLimit int
 }
 
-func (d *ZipDecompressor) Decompress(dst, src string, dir bool, umask os.FileMode) error {
+func (d *ZipDecompressor) Decompress(dst, src string, dir bool, umask os.FileMode) (err error) {
+	// Any security or integrity error aborts the batch and removes
+	// everything this batch created.
+	tracker := new(extractTracker)
+	defer func() {
+		if err != nil {
+			tracker.cleanup()
+		}
+	}()
+
 	// If we're going into a directory we should make that first
 	mkdir := dst
 	if !dir {
 		mkdir = filepath.Dir(dst)
 	}
-	if err := os.MkdirAll(mkdir, mode(0755, umask)); err != nil {
+	if err = tracker.mkdirAll(mkdir, mode(0755, umask)); err != nil {
 		return err
 	}
 
@@ -62,12 +76,12 @@ func (d *ZipDecompressor) Decompress(dst, src string, dir bool, umask os.FileMod
 	for _, f := range zipR.File {
 		path := dst
 		if dir {
-			// Disallow parent traversal
-			if containsDotDot(f.Name) {
-				return fmt.Errorf("entry contains '..': %s", f.Name)
+			// Normalize the entry name and verify the final path stays
+			// inside the destination root.
+			path, err = secureJoinPath(dst, f.Name)
+			if err != nil {
+				return err
 			}
-
-			path = filepath.Join(path, f.Name)
 		}
 
 		fileInfo := f.FileInfo()
@@ -84,7 +98,7 @@ func (d *ZipDecompressor) Decompress(dst, src string, dir bool, umask os.FileMod
 			}
 
 			// A directory, just make the directory and continue unarchiving...
-			if err := os.MkdirAll(path, mode(0755, umask)); err != nil {
+			if err := tracker.mkdirAll(path, mode(0755, umask)); err != nil {
 				return err
 			}
 
@@ -95,7 +109,7 @@ func (d *ZipDecompressor) Decompress(dst, src string, dir bool, umask os.FileMod
 		// required to contain entries for just the directories so this
 		// can happen.
 		if dir {
-			if err := os.MkdirAll(filepath.Dir(path), mode(0755, umask)); err != nil {
+			if err := tracker.mkdirAll(filepath.Dir(path), mode(0755, umask)); err != nil {
 				return err
 			}
 		}
@@ -109,6 +123,25 @@ func (d *ZipDecompressor) Decompress(dst, src string, dir bool, umask os.FileMod
 			return err
 		}
 
+		// A symlink entry stores its target as the entry contents. The
+		// target must resolve to a location inside the destination root.
+		if dir && f.Mode()&os.ModeSymlink != 0 {
+			target, err := readLinkTarget(srcF)
+			_ = srcF.Close()
+			if err != nil {
+				return err
+			}
+			if err := secureLinkTarget(dst, path, target); err != nil {
+				return err
+			}
+			_ = os.Remove(path)
+			if err := os.Symlink(target, path); err != nil {
+				return err
+			}
+			tracker.track(path)
+			continue
+		}
+
 		// Size limit is tracked using the returned file info.
 
 		// Sanitize file permissions to avoid permissions escalation attacks
@@ -120,7 +153,21 @@ func (d *ZipDecompressor) Decompress(dst, src string, dir bool, umask os.FileMod
 		if err != nil {
 			return err
 		}
+		tracker.track(path)
 	}
 
 	return nil
+}
+
+// readLinkTarget reads a symbolic link target from a zip entry, bounding the
+// size so a bogus entry cannot exhaust memory.
+func readLinkTarget(r io.Reader) (string, error) {
+	b, err := io.ReadAll(io.LimitReader(r, maxLinkTargetSize+1))
+	if err != nil {
+		return "", err
+	}
+	if len(b) > maxLinkTargetSize {
+		return "", fmt.Errorf("archive link target too long: %d > %d", len(b), maxLinkTargetSize)
+	}
+	return string(b), nil
 }

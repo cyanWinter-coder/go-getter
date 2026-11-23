@@ -13,8 +13,9 @@ import (
 // support for decompressing a type.
 //
 // Important: if you're implementing a decompressor, please use the
-// containsDotDot helper in this file to ensure that files can't be
-// decompressed outside of the specified directory.
+// secureJoinPath and secureLinkTarget helpers (see decompress_secure.go) to
+// ensure that entries, including link targets, can't be decompressed outside
+// of the specified directory.
 type Decompressor interface {
 	// Decompress should decompress src to dst. dir specifies whether dst
 	// is a directory or single file. src is guaranteed to be a single file

@@ -14,11 +14,26 @@ import (
 
 // untar is a shared helper for untarring an archive. The reader should provide
 // an uncompressed view of the tar archive.
-func untar(input io.Reader, dst, src string, dir bool, umask os.FileMode, fileSizeLimit int64, filesLimit int) error {
+//
+// Every path an entry would create is normalized and verified to stay inside
+// dst before it is written, and symbolic/hard link targets are constrained to
+// resolve inside dst as well. All paths created by this call are recorded in
+// tracker so the caller can roll the batch back on error.
+func untar(input io.Reader, dst, src string, dir bool, umask os.FileMode, fileSizeLimit int64, filesLimit int, tracker *extractTracker) error {
 	tarR := tar.NewReader(input)
 	done := false
-	dirHdrs := []*tar.Header{}
+	type dirInfo struct {
+		hdr  *tar.Header
+		path string
+	}
+	dirHdrs := []dirInfo{}
 	now := time.Now()
+
+	// root is the directory all entries must stay within.
+	root := dst
+	if !dir {
+		root = filepath.Dir(dst)
+	}
 
 	var (
 		fileSize   int64
@@ -53,12 +68,12 @@ func untar(input io.Reader, dst, src string, dir bool, umask os.FileMode, fileSi
 
 		path := dst
 		if dir {
-			// Disallow parent traversal
-			if containsDotDot(hdr.Name) {
-				return fmt.Errorf("entry contains '..': %s", hdr.Name)
+			// Normalize the entry name and verify the final path stays
+			// inside the destination root.
+			path, err = secureJoinPath(root, hdr.Name)
+			if err != nil {
+				return err
 			}
-
-			path = filepath.Join(path, hdr.Name)
 		}
 
 		fileInfo := hdr.FileInfo()
@@ -75,26 +90,52 @@ func untar(input io.Reader, dst, src string, dir bool, umask os.FileMode, fileSi
 			}
 
 			// A directory, just make the directory and continue unarchiving...
-			if err := os.MkdirAll(path, mode(0755, umask)); err != nil {
+			if err := tracker.mkdirAll(path, mode(0755, umask)); err != nil {
 				return err
 			}
 
 			// Record the directory information so that we may set its attributes
 			// after all files have been extracted
-			dirHdrs = append(dirHdrs, hdr)
+			dirHdrs = append(dirHdrs, dirInfo{hdr: hdr, path: path})
 
 			continue
-		} else {
-			// There is no ordering guarantee that a file in a directory is
-			// listed before the directory
-			dstPath := filepath.Dir(path)
+		}
 
-			// Check that the directory exists, otherwise create it
-			if _, err := os.Stat(dstPath); os.IsNotExist(err) {
-				if err := os.MkdirAll(dstPath, mode(0755, umask)); err != nil {
-					return err
-				}
+		// There is no ordering guarantee that a file in a directory is
+		// listed before the directory, so make sure the parent exists.
+		if dir {
+			if err := tracker.mkdirAll(filepath.Dir(path), mode(0755, umask)); err != nil {
+				return err
 			}
+		}
+
+		if dir && hdr.Typeflag == tar.TypeSymlink {
+			// The link target must resolve to a location inside the
+			// destination root.
+			if err := secureLinkTarget(root, path, hdr.Linkname); err != nil {
+				return err
+			}
+			_ = os.Remove(path)
+			if err := os.Symlink(hdr.Linkname, path); err != nil {
+				return err
+			}
+			tracker.track(path)
+			continue
+		}
+
+		if dir && hdr.Typeflag == tar.TypeLink {
+			// Hard link targets are relative to the archive root; the
+			// joined path must stay inside the destination root.
+			targetPath, err := secureJoinPath(root, hdr.Linkname)
+			if err != nil {
+				return err
+			}
+			_ = os.Remove(path)
+			if err := os.Link(targetPath, path); err != nil {
+				return err
+			}
+			tracker.track(path)
+			continue
 		}
 
 		// We have a file. If we already decoded, then it is an error
@@ -114,6 +155,7 @@ func untar(input io.Reader, dst, src string, dir bool, umask os.FileMode, fileSi
 		if err != nil {
 			return err
 		}
+		tracker.track(path)
 
 		// Set the access and modification time if valid, otherwise default to current time
 		aTime := now
@@ -130,22 +172,21 @@ func untar(input io.Reader, dst, src string, dir bool, umask os.FileMode, fileSi
 	}
 
 	// Perform a final pass over extracted directories to update metadata
-	for _, dirHdr := range dirHdrs {
-		path := filepath.Join(dst, dirHdr.Name)
+	for _, d := range dirHdrs {
 		// Chmod the directory since they might be created before we know the mode flags
-		if err := os.Chmod(path, mode(dirHdr.FileInfo().Mode(), umask)); err != nil {
+		if err := os.Chmod(d.path, mode(d.hdr.FileInfo().Mode(), umask)); err != nil {
 			return err
 		}
 		// Set the mtime/atime attributes since they would have been changed during extraction
 		aTime := now
 		mTime := now
-		if dirHdr.AccessTime.Unix() > 0 {
-			aTime = dirHdr.AccessTime
+		if d.hdr.AccessTime.Unix() > 0 {
+			aTime = d.hdr.AccessTime
 		}
-		if dirHdr.ModTime.Unix() > 0 {
-			mTime = dirHdr.ModTime
+		if d.hdr.ModTime.Unix() > 0 {
+			mTime = d.hdr.ModTime
 		}
-		if err := os.Chtimes(path, aTime, mTime); err != nil {
+		if err := os.Chtimes(d.path, aTime, mTime); err != nil {
 			return err
 		}
 	}
@@ -169,13 +210,22 @@ type TarDecompressor struct {
 	FilesLimit int
 }
 
-func (d *TarDecompressor) Decompress(dst, src string, dir bool, umask os.FileMode) error {
+func (d *TarDecompressor) Decompress(dst, src string, dir bool, umask os.FileMode) (err error) {
+	// Any security or integrity error aborts the batch and removes
+	// everything this batch created.
+	tracker := new(extractTracker)
+	defer func() {
+		if err != nil {
+			tracker.cleanup()
+		}
+	}()
+
 	// If we're going into a directory we should make that first
 	mkdir := dst
 	if !dir {
 		mkdir = filepath.Dir(dst)
 	}
-	if err := os.MkdirAll(mkdir, mode(0755, umask)); err != nil {
+	if err = tracker.mkdirAll(mkdir, mode(0755, umask)); err != nil {
 		return err
 	}
 
@@ -186,5 +236,5 @@ func (d *TarDecompressor) Decompress(dst, src string, dir bool, umask os.FileMod
 	}
 	defer func() { _ = f.Close() }()
 
-	return untar(f, dst, src, dir, umask, d.FileSizeLimit, d.FilesLimit)
+	return untar(f, dst, src, dir, umask, d.FileSizeLimit, d.FilesLimit, tracker)
 }
