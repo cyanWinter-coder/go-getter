@@ -328,16 +328,18 @@ func (c *Client) Get() error {
 
 	// If we have a subdir, copy that over
 	if subDir != "" {
+		// Process any globs and verify the subdir stays within the
+		// download root before we touch the real destination, so a
+		// failing subdir never modifies it.
+		subDir, err := SubdirGlob(dst, subDir)
+		if err != nil {
+			return err
+		}
+
 		if err := os.RemoveAll(realDst); err != nil {
 			return err
 		}
 		if err := os.MkdirAll(realDst, c.mode(0755)); err != nil {
-			return err
-		}
-
-		// Process any globs
-		subDir, err := SubdirGlob(dst, subDir)
-		if err != nil {
 			return err
 		}
 

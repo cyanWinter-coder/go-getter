@@ -1014,7 +1014,10 @@ func TestGitGetter_subdirectory_malicious_symlink(t *testing.T) {
 		t.Fatalf("expected /etc/passwd to not exist in destination")
 	}
 
-	if !errors.Is(err, ErrSymlinkCopy) {
+	// The escape is caught either while resolving the subdir
+	// (ErrSubdirOutsideRoot) or later during the copy when symlinks are
+	// disabled (ErrSymlinkCopy); both mean the destination was protected.
+	if !errors.Is(err, ErrSubdirOutsideRoot) && !errors.Is(err, ErrSymlinkCopy) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 

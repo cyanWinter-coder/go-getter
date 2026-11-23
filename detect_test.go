@@ -4,6 +4,7 @@
 package getter
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 )
@@ -91,5 +92,64 @@ func TestDetect(t *testing.T) {
 				t.Fatalf("%d: bad output: %s\nexpected: %s", i, output, tc.Output)
 			}
 		})
+	}
+}
+
+func TestDetect_encodedBoundaries(t *testing.T) {
+	cases := []struct {
+		Input  string
+		Output string
+	}{
+		// Percent-encoded query values pass through detection
+		// byte-for-byte: they are decoded exactly once, by the getter
+		// that finally consumes the URL.
+		{
+			"github.com/hashicorp/go-getter//subdir?foo=bar%20baz",
+			"git::https://github.com/hashicorp/go-getter.git//subdir?foo=bar%20baz",
+		},
+		{
+			"github.com/hashicorp/go-getter//subdir?foo=a+b",
+			"git::https://github.com/hashicorp/go-getter.git//subdir?foo=a+b",
+		},
+		// An encoded slash in the path must not collapse into a path
+		// separator when the subdir is spliced back in.
+		{
+			"bucket.s3.amazonaws.com/foo%2Fbar//sub",
+			"s3::https://s3.amazonaws.com/bucket/foo%2Fbar//sub",
+		},
+		// A getter forced on the source wins over the one the detector
+		// would impose, and the result is not re-detected.
+		{
+			"http::github.com/hashicorp/foo",
+			"http::https://github.com/hashicorp/foo.git",
+		},
+		{
+			"http::github.com/hashicorp/foo//sub?x=1",
+			"http::https://github.com/hashicorp/foo.git//sub?x=1",
+		},
+	}
+
+	for i, tc := range cases {
+		t.Run(fmt.Sprintf("%d %s", i, tc.Input), func(t *testing.T) {
+			output, err := Detect(tc.Input, "", Detectors)
+			if err != nil {
+				t.Fatalf("err: %s", err)
+			}
+			if output != tc.Output {
+				t.Fatalf("bad output: %s\nexpected: %s", output, tc.Output)
+			}
+		})
+	}
+}
+
+func TestDetect_noDetectorStableError(t *testing.T) {
+	// With no detectors configured and a source that is not a valid URL,
+	// Detect must return the stable ErrNoDetector error.
+	_, err := Detect("github.com/hashicorp/foo", "", nil)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, ErrNoDetector) {
+		t.Fatalf("expected ErrNoDetector, got: %s", err)
 	}
 }

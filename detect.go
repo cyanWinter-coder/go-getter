@@ -4,11 +4,18 @@
 package getter
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 
 	"github.com/hashicorp/go-getter/helper/url"
 )
+
+// ErrNoDetector is returned (wrapped) by Detect when the source is neither
+// a valid URL nor matched by any of the configured detectors. The error is
+// stable: callers can test for it with errors.Is and no output is written
+// to the destination when it is returned.
+var ErrNoDetector = errors.New("invalid source string")
 
 // Detector defines the interface that an invalid URL or a URL with a blank
 // scheme is passed through in order to determine if its shorthand for
@@ -44,6 +51,15 @@ func init() {
 //
 // This is safe to be called with an already valid source string: Detect
 // will just return it.
+//
+// Detect decodes nothing: detector output is spliced back together with
+// the requested subdir and forced getter at the string level, so any
+// percent-encoded characters in the source are decoded exactly once, by
+// the getter that ultimately consumes the URL.
+//
+// A getter forced on the original source ("git::...") always takes
+// precedence over one imposed by a detector, and the detector result is
+// never fed back through Detect, so detection cannot loop.
 func Detect(src string, pwd string, ds []Detector) (string, error) {
 	getForce, getSrc := getForcedGetter(src)
 
@@ -80,22 +96,14 @@ func Detect(src string, pwd string, ds []Detector) (string, error) {
 		}
 
 		if subDir != "" {
-			u, err := url.Parse(result)
-			if err != nil {
-				return "", fmt.Errorf("Error parsing URL: %w", err)
-			}
-			u.Path += "//" + subDir
-
-			// a subdir may contain wildcards, but in order to support them we
-			// have to ensure the path isn't escaped.
-			u.RawPath = u.Path
-
-			result = u.String()
+			result = addSubdirToSource(result, subDir)
 		}
 
 		// Preserve the forced getter if it exists. We try to use the
 		// original set force first, followed by any force set by the
-		// detector.
+		// detector. The two are never combined and the result is never
+		// re-detected, so a forced getter cannot fall back into another
+		// round of detection.
 		if getForce != "" {
 			result = fmt.Sprintf("%s::%s", getForce, result)
 		} else if detectForce != "" {
@@ -105,5 +113,5 @@ func Detect(src string, pwd string, ds []Detector) (string, error) {
 		return result, nil
 	}
 
-	return "", fmt.Errorf("invalid source string: %s", src)
+	return "", fmt.Errorf("%w: %s", ErrNoDetector, src)
 }

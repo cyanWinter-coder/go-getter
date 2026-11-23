@@ -545,3 +545,48 @@ func TestGetFile_checksumSkip(t *testing.T) {
 		t.Fatalf("get should not have been called")
 	}
 }
+
+func TestGet_fileSubdirEncodedQuery(t *testing.T) {
+	dst := filepath.Join(t.TempDir(), "target")
+	u := testModule("basic//subdir")
+	u += "?foo=bar%20baz"
+
+	if err := Get(dst, u); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	mainPath := filepath.Join(dst, "sub.tf")
+	if _, err := os.Stat(mainPath); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+}
+
+func TestGet_detectFailureNoWrite(t *testing.T) {
+	dst := filepath.Join(t.TempDir(), "target")
+
+	// A relative path without a Pwd fails detection; nothing may be
+	// written to the destination in that case.
+	if err := Get(dst, "./foo"); err == nil {
+		t.Fatal("should error")
+	}
+	if _, err := os.Lstat(dst); !os.IsNotExist(err) {
+		t.Fatalf("dst should not exist, stat err: %v", err)
+	}
+}
+
+func TestGet_unknownForcedGetterNoWrite(t *testing.T) {
+	dst := filepath.Join(t.TempDir(), "target")
+
+	// A forced getter that is not configured must produce a stable
+	// error without falling back to another getter or writing to dst.
+	err := Get(dst, "nosuchgetter::https://example.com/foo")
+	if err == nil {
+		t.Fatal("should error")
+	}
+	if !strings.Contains(err.Error(), "download not supported") {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	if _, err := os.Lstat(dst); !os.IsNotExist(err) {
+		t.Fatalf("dst should not exist, stat err: %v", err)
+	}
+}
