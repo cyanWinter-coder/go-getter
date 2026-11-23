@@ -2,6 +2,7 @@
 
 IMPROVEMENTS:
 
+* client: Downloads are now staged next to the destination and only published after the checksum verifies, using atomic renames on the same filesystem. A checksum mismatch, cancelation, decompression failure, or failed final rename no longer modifies the existing destination, and staging files are always cleaned up. This verification terminal state is shared by the http, file, and archive code paths; downloads without a checksum keep working unchanged
 * http: Return a typed `*HTTPStatusError` for non-2xx response codes [[GH-660](https://github.com/hashicorp/go-getter/pull/660)]
 
 

@@ -356,6 +356,15 @@ func TestGetFile_checksum(t *testing.T) {
 				t.Fatalf("append: %s\n\nerr: %s", tc.Append, err)
 			}
 
+			if tc.Err {
+				// A failed checksum must not publish anything to the
+				// destination.
+				if _, err := os.Lstat(dst); !os.IsNotExist(err) {
+					t.Fatalf("append: %s\n\ndestination should not exist after checksum failure", tc.Append)
+				}
+				return
+			}
+
 			// Verify the main file exists
 			assertContents(t, dst, "Hello\n")
 		}()
@@ -446,6 +455,15 @@ func TestGetFile_checksum_from_file(t *testing.T) {
 			dst := filepath.Join(t.TempDir(), "test-file")
 			if err := GetFile(dst, u); (err != nil) != tc.WantErr {
 				t.Fatalf("append: %s\n\nerr: %s", tc.Append, err)
+			}
+
+			if tc.WantErr {
+				// A failed checksum must not publish anything to the
+				// destination.
+				if _, err := os.Lstat(dst); !os.IsNotExist(err) {
+					t.Fatalf("append: %s\n\ndestination should not exist after checksum failure", tc.Append)
+				}
+				return
 			}
 
 			if tc.WantTransfer {

@@ -474,6 +474,18 @@ func (g *HttpGetter) GetFile(dst string, src *url.URL) error {
 		}
 	}
 
+	if currentFileSize == 0 {
+		// We're not resuming: discard any stale content the file may
+		// hold (e.g. seeded from a previous download) so the full body
+		// written below cannot leave extra bytes appended.
+		if err := f.Truncate(0); err != nil {
+			return err
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+	}
+
 	readCtx := ctx
 
 	if g.ReadTimeout > 0 {
@@ -552,13 +564,17 @@ func (g *HttpGetter) getSubdir(ctx context.Context, dst, source, subDir string, 
 		return fmt.Errorf("downloading %s: %s", source, err)
 	}
 
-	// Copy the subdirectory into our actual destination.
-	if err := os.RemoveAll(dst); err != nil {
+	// Copy the subdirectory into a staging area next to the actual
+	// destination, then publish it atomically: the current destination
+	// is only replaced once the copy has completed.
+	staged, err := stage(dst)
+	if err != nil {
 		return err
 	}
+	defer staged.cleanup()
 
-	// Make the final destination
-	if err := os.MkdirAll(dst, g.client.mode(0755)); err != nil {
+	// Make the staging destination
+	if err := os.MkdirAll(staged.path, g.client.mode(0755)); err != nil {
 		return err
 	}
 
@@ -568,7 +584,11 @@ func (g *HttpGetter) getSubdir(ctx context.Context, dst, source, subDir string, 
 		disableSymlinks = true
 	}
 
-	return copyDir(ctx, dst, sourcePath, false, disableSymlinks, g.client.umask())
+	if err := copyDir(ctx, staged.path, sourcePath, false, disableSymlinks, g.client.umask()); err != nil {
+		return err
+	}
+
+	return staged.publish()
 }
 
 // parseMeta looks for the first meta tag in the given reader that

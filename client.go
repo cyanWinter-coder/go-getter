@@ -268,23 +268,59 @@ func (c *Client) Get() error {
 			}
 		}
 		if getFile {
-			err := g.GetFile(dst, u)
+			// Stage the download next to the final destination: the
+			// destination is only published once the download is
+			// complete and its checksum verified, so a failed or
+			// canceled download never modifies the destination. This
+			// verification terminal state is shared by all getters
+			// (http, file, ...) since it lives in the Client.
+			staged, err := stage(dst)
+			if err != nil {
+				return err
+			}
+			defer staged.cleanup()
+
+			// Seed the staging area with any previous (partial)
+			// download so getters can resume it, without touching
+			// the destination itself.
+			if err := staged.seed(); err != nil {
+				return err
+			}
+
+			err = g.GetFile(staged.path, u)
 			if err != nil {
 				return err
 			}
 
 			if checksum != nil {
-				if err := checksum.checksum(dst); err != nil {
+				if err := checksum.checksum(staged.path); err != nil {
 					return err
 				}
+			}
+
+			if err := staged.publish(); err != nil {
+				return err
 			}
 		}
 
 		if decompressor != nil {
-			// We have a decompressor, so decompress the current destination
-			// into the final destination with the proper mode.
-			err := decompressor.Decompress(decompressDst, dst, decompressDir, c.umask())
+			// Decompress into a staging area next to the final
+			// destination and publish it atomically, so a failed
+			// extraction cannot leave a partially written destination.
+			staged, err := stage(decompressDst)
 			if err != nil {
+				return err
+			}
+			defer staged.cleanup()
+
+			// We have a decompressor, so decompress the current destination
+			// into the staging area with the proper mode.
+			err = decompressor.Decompress(staged.path, dst, decompressDir, c.umask())
+			if err != nil {
+				return err
+			}
+
+			if err := staged.publish(); err != nil {
 				return err
 			}
 
@@ -328,20 +364,30 @@ func (c *Client) Get() error {
 
 	// If we have a subdir, copy that over
 	if subDir != "" {
-		if err := os.RemoveAll(realDst); err != nil {
-			return err
-		}
-		if err := os.MkdirAll(realDst, c.mode(0755)); err != nil {
-			return err
-		}
-
 		// Process any globs
 		subDir, err := SubdirGlob(dst, subDir)
 		if err != nil {
 			return err
 		}
 
-		return copyDir(c.Ctx, realDst, subDir, false, c.DisableSymlinks, c.umask())
+		// Copy the subdir into a staging area next to the real
+		// destination, then publish it atomically: the current
+		// destination is only replaced once the copy has completed.
+		staged, err := stage(realDst)
+		if err != nil {
+			return err
+		}
+		defer staged.cleanup()
+
+		if err := os.MkdirAll(staged.path, c.mode(0755)); err != nil {
+			return err
+		}
+
+		if err := copyDir(c.Ctx, staged.path, subDir, false, c.DisableSymlinks, c.umask()); err != nil {
+			return err
+		}
+
+		return staged.publish()
 	}
 
 	return nil
