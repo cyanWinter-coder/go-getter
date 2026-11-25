@@ -39,7 +39,11 @@ func (g *GitGetter) ClientMode(_ *url.URL) (ClientMode, error) {
 }
 
 func (g *GitGetter) Get(dst string, u *url.URL) error {
-	ctx := g.Context()
+	client := g.getClient()
+	ctx := context.Background()
+	if client != nil && client.Ctx != nil {
+		ctx = client.Ctx
+	}
 
 	if g.Timeout > 0 {
 		var cancel context.CancelFunc
@@ -119,29 +123,34 @@ func (g *GitGetter) Get(dst string, u *url.URL) error {
 		}
 	}
 
-	// Clone or update the repository
-	_, err := os.Stat(dst)
-	if err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	if err == nil {
-		err = g.update(ctx, dst, sshKeyFile, u, ref, depth)
-	} else {
-		err = g.clone(ctx, dst, sshKeyFile, u, ref, depth)
-	}
+	// Prepare the repository in an unpublished recovery directory, pin the
+	// ref to one resolved commit, and atomically publish it to dst. This keeps
+	// an interrupted fetch, checkout, or submodule update from leaving a mix
+	// of old and new worktree files in the requested destination.
+	rc, err := newRecoverableGitClone(dst, u, ref, depth, sshKeyFile)
 	if err != nil {
 		return err
 	}
-
-	// Next: check out the proper tag/branch if it is specified, and checkout
-	if ref != "" {
-		if err := g.checkout(ctx, dst, ref); err != nil {
+	flightKey := gitCloneFlightKey(rc.dst, rc.sourceText, ref, depth, sshKey, g.Timeout)
+	return runGitCloneFlight(ctx, flightKey, func(flightCtx context.Context) error {
+		if err := os.MkdirAll(filepath.Dir(rc.dst), 0o755); err != nil {
 			return err
 		}
-	}
 
-	// Lastly, download any/all submodules.
-	return g.fetchSubmodules(ctx, dst, sshKeyFile, depth)
+		unlockMemory, err := lockGitDestination(flightCtx, rc.dst)
+		if err != nil {
+			return err
+		}
+		defer unlockMemory()
+
+		unlockProcess, err := lockGitProcessFile(flightCtx, rc.dst+".lock")
+		if err != nil {
+			return err
+		}
+		defer unlockProcess()
+
+		return rc.run(flightCtx, g, client)
+	})
 }
 
 // GetFile for Git doesn't support updating at this time. It will download
@@ -325,8 +334,12 @@ func (g *GitGetter) update(ctx context.Context, dst, sshKeyFile string, u *url.U
 
 // fetchSubmodules downloads any configured submodules recursively.
 func (g *GitGetter) fetchSubmodules(ctx context.Context, dst, sshKeyFile string, depth int) error {
-	if g.client != nil {
-		g.client.DisableSymlinks = true
+	return g.fetchSubmodulesForClient(ctx, dst, sshKeyFile, depth, g.getClient())
+}
+
+func (g *GitGetter) fetchSubmodulesForClient(ctx context.Context, dst, sshKeyFile string, depth int, client *Client) error {
+	if client != nil {
+		client.DisableSymlinks = true
 	}
 	args := []string{"submodule", "update", "--init", "--recursive"}
 	if depth > 0 {
@@ -335,7 +348,7 @@ func (g *GitGetter) fetchSubmodules(ctx context.Context, dst, sshKeyFile string,
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dst
 	setupGitEnv(cmd, sshKeyFile)
-	return getRunCommand(cmd)
+	return runGitCommand(ctx, cmd)
 }
 
 // findRemoteDefaultBranch checks the remote repo's HEAD symref to return the remote repo's

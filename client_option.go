@@ -40,7 +40,18 @@ func (c *Client) Configure(opts ...ClientOption) error {
 		c.Detectors = Detectors
 	}
 	if c.Getters == nil {
-		c.Getters = Getters
+		// Give each Client its own mutable GitGetter state. The default
+		// getter registry contains singletons whose client pointer cannot
+		// safely identify one concurrent Client among several.
+		c.Getters = make(map[string]Getter, len(Getters))
+		for name, getter := range Getters {
+			if gitGetter, ok := getter.(*GitGetter); ok {
+				getterCopy := *gitGetter
+				c.Getters[name] = &getterCopy
+			} else {
+				c.Getters[name] = getter
+			}
+		}
 	}
 
 	// Set the client for each getter, so the top-level client can know
