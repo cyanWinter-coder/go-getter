@@ -389,11 +389,23 @@ func (g *HttpGetter) Get(dst string, u *url.URL) error {
 }
 
 // GetFile fetches the file from src and stores it at dst.
-// If the server supports Accept-Range, HttpGetter will attempt a range
-// request. This means it is the caller's responsibility to ensure that an
-// older version of the destination file does not exist, else it will be either
-// falsely identified as being replaced, or corrupted with extra bytes
-// appended.
+//
+// GetFile is safe to call repeatedly against the same dst, which acts as the
+// resumable partial file:
+//
+//   - Validators (ETag/Last-Modified) and the canonical URL of the resource
+//     the partial bytes belong to are persisted next to dst. A resume request
+//     carries the validator in If-Range.
+//   - A 200 response always means the server sent the full representation, so
+//     any previous partial bytes are truncated before writing. A 206 response
+//     is only appended when its declared Content-Range continues exactly at
+//     the persisted size and its validator/URL match the recorded state.
+//   - When the server ignores Range, the validator changes, or a redirect
+//     lands on a different canonical resource, incompatible partial state is
+//     discarded and the entity is downloaded from the beginning.
+//
+// Progress is reported from the number of bytes already persisted in dst.
+// After a failure or cancellation the length of dst is the resumable offset.
 func (g *HttpGetter) GetFile(dst string, src *url.URL) error {
 	ctx := g.Context()
 
@@ -428,9 +440,21 @@ func (g *HttpGetter) GetFile(dst string, src *url.URL) error {
 		}
 	}
 
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	localSize := fi.Size()
+
+	// Persisted identity of the partial bytes, if a previous attempt recorded
+	// one. A manually supplied partial file simply has no state.
+	st := loadResumeState(dst)
+
 	var (
-		currentFileSize int64
-		req             *http.Request
+		headETag, headLastModified string
+		headFinalURL               string
+		headTotal                  int64 = -1
+		headAcceptRanges           bool
 	)
 
 	if !g.DoNotCheckHeadFirst {
@@ -446,7 +470,7 @@ func (g *HttpGetter) GetFile(dst string, src *url.URL) error {
 		// We first make a HEAD request so we can check
 		// if the server supports range queries. If the server/URL doesn't
 		// support HEAD requests, we just fall back to GET.
-		req, err = http.NewRequestWithContext(headCtx, "HEAD", src.String(), nil)
+		req, err := http.NewRequestWithContext(headCtx, "HEAD", src.String(), nil)
 		if err != nil {
 			return err
 		}
@@ -457,20 +481,56 @@ func (g *HttpGetter) GetFile(dst string, src *url.URL) error {
 		if err == nil {
 			_ = headResp.Body.Close()
 			if headResp.StatusCode == 200 {
-				// If the HEAD request succeeded, then attempt to set the range
-				// query if we can.
-				if headResp.Header.Get("Accept-Ranges") == "bytes" && headResp.ContentLength > 0 {
-					if fi, err := f.Stat(); err == nil {
-						if _, err = f.Seek(0, io.SeekEnd); err == nil {
-							currentFileSize = fi.Size()
-							if currentFileSize >= headResp.ContentLength {
-								// file already present
-								return nil
-							}
-						}
-					}
+				headETag, headLastModified = headerValidator(headResp.Header)
+				headFinalURL = canonicalURL(headResp.Request.URL)
+				if cl := headResp.ContentLength; cl > 0 {
+					headTotal = cl
+				}
+				if strings.EqualFold(strings.TrimSpace(headResp.Header.Get("Accept-Ranges")), "bytes") {
+					headAcceptRanges = true
+				}
+
+				// If the HEAD request succeeded and the file is already
+				// complete according to the server, there is nothing to do -
+				// but only when its validators/resource identity match the
+				// partial state, otherwise the local bytes may be a different
+				// representation.
+				urlMatches := st == nil || st.URL == "" || headFinalURL == "" || st.URL == headFinalURL
+				if headAcceptRanges && headTotal > 0 && localSize >= headTotal &&
+					urlMatches && !validatorsDiffer(st, headETag, headLastModified) {
+					// The persisted file already covers the full entity and
+					// belongs to the same representation.
+					removeResumeState(dst)
+					return nil
 				}
 			}
+		}
+	}
+
+	// Decide whether the existing file can be used as a resume offset. We only
+	// issue a Range request when the size of the object is known (from HEAD or
+	// persisted state) or we have a validator proving the identity of the
+	// partial bytes. An unadvertised/unknown-size endpoint gets a plain GET and
+	// the stale tail is truncated.
+	var (
+		rangeOffset int64
+		ifRange     string
+	)
+	stateKnowsSize := st != nil && st.TotalSize > 0
+	stateHasValidator := st != nil && (st.ETag != "" || st.LastModified != "")
+
+	if localSize > 0 && (headTotal > 0 || stateKnowsSize || stateHasValidator) {
+		rangeOffset = localSize
+		ifRange = ifRangeValidator(st, headETag, headLastModified)
+		if _, err := f.Seek(localSize, io.SeekStart); err != nil {
+			return err
+		}
+	} else {
+		// Plain full download. Only reposition here; the stale tail is
+		// truncated once a 200/full response is actually accepted below, so a
+		// failed request still leaves the previous partial resumable.
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return err
 		}
 	}
 
@@ -482,47 +542,236 @@ func (g *HttpGetter) GetFile(dst string, src *url.URL) error {
 		defer cancel()
 	}
 
-	req, err = http.NewRequestWithContext(readCtx, "GET", src.String(), nil)
-	if err != nil {
-		return err
-	}
-	if g.Header != nil {
-		req.Header = g.Header.Clone()
-	}
-	if currentFileSize > 0 {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", currentFileSize))
+	maxBytes := httpMaxBytesFromContext(ctx)
+	filename := filepath.Base(src.EscapedPath())
+
+	// At most two GET attempts: the normal one, plus a single unconditional
+	// full GET when the first response proves the partial state is unusable
+	// (incompatible 206/416). A 200 response already carries the full entity
+	// and is consumed directly after truncating.
+	for attempt := 0; attempt < 2; attempt++ {
+		req, err := http.NewRequestWithContext(readCtx, "GET", src.String(), nil)
+		if err != nil {
+			return err
+		}
+		if g.Header != nil {
+			req.Header = g.Header.Clone()
+		}
+		if rangeOffset > 0 {
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", rangeOffset))
+			if ifRange != "" {
+				req.Header.Set("If-Range", ifRange)
+			}
+		}
+
+		resp, err := g.Client.Do(req)
+		if err != nil {
+			return err
+		}
+
+		switch resp.StatusCode {
+		case http.StatusOK, http.StatusPartialContent, http.StatusRequestedRangeNotSatisfiable:
+			// all processable statuses
+		default:
+			_ = resp.Body.Close()
+			return &HTTPStatusError{StatusCode: resp.StatusCode}
+		}
+
+		finalURL := canonicalURL(resp.Request.URL)
+		etag, lastModified := headerValidator(resp.Header)
+		cr := parseContentRange(resp.Header.Get("Content-Range"))
+
+		urlMismatch := st != nil && st.URL != "" && finalURL != "" && st.URL != finalURL
+		validatorMismatch := validatorsDiffer(st, etag, lastModified)
+
+		// knownTotal is the full object size when it can be established.
+		// Persisted/HEAD knowledge takes precedence over the 200
+		// Content-Length: a non-standard 200 response may carry only the
+		// requested suffix, making its Content-Length the remainder rather
+		// than the full size.
+		knownTotal := int64(-1)
+		switch {
+		case cr != nil && cr.total > 0:
+			knownTotal = cr.total
+		case st != nil && st.TotalSize > 0:
+			knownTotal = st.TotalSize
+		case headTotal > 0:
+			knownTotal = headTotal
+		case resp.StatusCode == http.StatusOK && resp.ContentLength > 0:
+			knownTotal = resp.ContentLength
+		}
+
+		// retryFresh asks to discard the partial state and repeat the GET
+		// without a Range/If-Range precondition.
+		retryFresh := false
+		// appendMode writes the response body after the persisted prefix;
+		// otherwise the file is truncated and the body is written from zero.
+		appendMode := false
+		writeOffset := int64(0)
+
+		switch resp.StatusCode {
+		case http.StatusRequestedRangeNotSatisfiable:
+			// The server no longer agrees with the range, typically because
+			// the representation changed. Re-fetch unconditionally.
+			retryFresh = true
+
+		case http.StatusOK:
+			// RFC 9110: a 200 response to a Range request means the server
+			// ignored the range and this body is the COMPLETE representation.
+			// Truncate the old partial before writing it.
+			//
+			// Compatibility exception: some non-standard test servers answer
+			// 200 with exactly the requested suffix (Content-Length equals the
+			// remaining byte count known from HEAD/state). Appending that
+			// declared remainder is safe and keeps those flows working.
+			quirkySuffix := rangeOffset > 0 &&
+				!urlMismatch && !validatorMismatch &&
+				knownTotal > rangeOffset &&
+				resp.ContentLength >= 0 &&
+				resp.ContentLength == knownTotal-rangeOffset &&
+				resp.ContentLength != knownTotal
+
+			if quirkySuffix {
+				appendMode = true
+				writeOffset = rangeOffset
+			}
+
+		case http.StatusPartialContent:
+			// A 206 must only extend the persisted prefix at the exact
+			// declared offset and only for the same resource/validator.
+			start := rangeOffset
+			if cr != nil && cr.complete {
+				start = cr.start
+			}
+			if urlMismatch || validatorMismatch || start != rangeOffset {
+				retryFresh = true
+			} else {
+				appendMode = true
+				writeOffset = start
+			}
+		}
+
+		if retryFresh {
+			_ = resp.Body.Close()
+			if attempt == 1 {
+				return fmt.Errorf("server returned incompatible partial content for %s", RedactURL(src))
+			}
+			if err := discardPartial(f, dst); err != nil {
+				return err
+			}
+			st = nil
+			rangeOffset = 0
+			ifRange = ""
+			continue
+		}
+
+		// Position the file according to the validated response.
+		if appendMode {
+			if _, err := f.Seek(writeOffset, io.SeekStart); err != nil {
+				_ = resp.Body.Close()
+				return err
+			}
+		} else {
+			if err := f.Truncate(0); err != nil {
+				_ = resp.Body.Close()
+				return err
+			}
+			if _, err := f.Seek(0, io.SeekStart); err != nil {
+				_ = resp.Body.Close()
+				return err
+			}
+			writeOffset = 0
+		}
+
+		// Total size used for progress reporting.
+		progressTotal := knownTotal
+		if progressTotal <= 0 && resp.ContentLength >= 0 {
+			if resp.StatusCode == http.StatusPartialContent {
+				progressTotal = writeOffset + resp.ContentLength
+			} else {
+				progressTotal = resp.ContentLength
+			}
+		}
+
+		// Persist the identity/validators of the bytes about to be streamed
+		// before streaming them, so a cancellation still leaves resumable
+		// metadata behind.
+		newSt := &resumeState{URL: finalURL}
+		switch {
+		case etag != "":
+			newSt.ETag = etag
+		case st != nil && st.ETag != "":
+			newSt.ETag = st.ETag
+		default:
+			newSt.ETag = headETag
+		}
+		switch {
+		case lastModified != "":
+			newSt.LastModified = lastModified
+		case st != nil && st.LastModified != "":
+			newSt.LastModified = st.LastModified
+		default:
+			newSt.LastModified = headLastModified
+		}
+		if knownTotal > 0 {
+			newSt.TotalSize = knownTotal
+		} else if st != nil && st.TotalSize > 0 {
+			newSt.TotalSize = st.TotalSize
+		} else if headTotal > 0 {
+			newSt.TotalSize = headTotal
+		}
+		// Resume metadata is best-effort: if it cannot be written (unusual
+		// destinations such as /dev/null), the download itself must proceed.
+		// A missing state simply disables validator-backed resume next time.
+		_ = newSt.save(dst)
+		st = newSt
+
+		body := resp.Body
+
+		if maxBytes > 0 {
+			body = newLimitedWrappedReaderCloser(body, maxBytes)
+		}
+
+		// For a 206 with a complete Content-Range, never persist more than
+		// the declared interval.
+		if resp.StatusCode == http.StatusPartialContent && cr != nil && cr.complete {
+			if declared := cr.end - cr.start + 1; declared > 0 {
+				body = newLimitedWrappedReaderCloser(body, declared)
+			}
+		}
+
+		if g.client != nil && g.client.ProgressListener != nil {
+			// track download starting from the bytes already persisted
+			body = g.client.ProgressListener.TrackProgress(filename, writeOffset, progressTotal, body)
+		}
+
+		n, err := Copy(readCtx, f, body)
+		_ = body.Close()
+		if err != nil {
+			// Best-effort flush so the file length and data surviving a
+			// failure/cancellation are actually on disk and resumable.
+			_ = f.Sync()
+			return err
+		}
+		if resp.ContentLength >= 0 && n < resp.ContentLength {
+			return io.ErrShortWrite
+		}
+
+		// A chunked 206 can end cleanly before the declared interval without
+		// tripping the Content-Length check; verify the declared interval was
+		// persisted in full. Range requests are not transparently gunzipped by
+		// net/http, so the byte counts are comparable.
+		if resp.StatusCode == http.StatusPartialContent && cr != nil && cr.complete {
+			if declared := cr.end - cr.start + 1; n < declared {
+				return io.ErrShortWrite
+			}
+		}
+
+		removeResumeState(dst)
+		return nil
 	}
 
-	resp, err := g.Client.Do(req)
-	if err != nil {
-		return err
-	}
-	switch resp.StatusCode {
-	case http.StatusOK, http.StatusPartialContent:
-		// all good
-	default:
-		_ = resp.Body.Close()
-		return &HTTPStatusError{StatusCode: resp.StatusCode}
-	}
-
-	body := resp.Body
-
-	if maxBytes := httpMaxBytesFromContext(ctx); maxBytes > 0 {
-		body = newLimitedWrappedReaderCloser(body, maxBytes)
-	}
-
-	if g.client != nil && g.client.ProgressListener != nil {
-		// track download
-		fn := filepath.Base(src.EscapedPath())
-		body = g.client.ProgressListener.TrackProgress(fn, currentFileSize, currentFileSize+resp.ContentLength, resp.Body)
-	}
-	defer func() { _ = body.Close() }()
-
-	n, err := Copy(readCtx, f, body)
-	if err == nil && n < resp.ContentLength {
-		err = io.ErrShortWrite
-	}
-	return err
+	return fmt.Errorf("too many incompatible resume responses for %s", RedactURL(src))
 }
 
 // getSubdir downloads the source into the destination, but with
